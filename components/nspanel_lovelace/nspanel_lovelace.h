@@ -173,6 +173,10 @@ public:
   bool upload_tft(const std::string &url);
 #endif
 
+void render_page(size_t index) {
+  render_page_(index);
+}
+  
 protected:
   bool restore_state_();
   bool save_state_();
