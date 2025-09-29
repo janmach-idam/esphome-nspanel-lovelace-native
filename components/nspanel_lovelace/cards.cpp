@@ -140,6 +140,7 @@ void AlarmCard::on_entity_state_change(const std::string &state) {
 
   if (state == entity_state::triggered || 
       state == entity_state::arming || 
+      state == entity_state::disarming || 
       state == entity_state::pending) {
     this->status_icon_flashing_ = true;
   }
@@ -182,9 +183,15 @@ std::string &AlarmCard::render(std::string &buffer) {
 
   buffer.append(1, SEPARATOR).append(this->status_icon_->render());
 
-  buffer.append(1, SEPARATOR)
-    .append(this->show_keypad_ ? 
-      generic_type::enable : generic_type::disable);
+  // Only disable keypad when alarm is disarmed, since arming always requires code
+  if (this->alarm_entity_->is_state(entity_state::disarmed)) {
+        buffer.append(1, SEPARATOR)
+        .append(this->show_keypad_ ? 
+          generic_type::enable : generic_type::disable);
+  } else {
+    buffer.append(1, SEPARATOR)
+        .append(generic_type::enable);
+  }
 
   buffer.append(1, SEPARATOR)
     .append(this->status_icon_flashing_ ? 

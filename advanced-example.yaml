@@ -16,6 +16,7 @@ esp32:
   framework:
     # ESP-IDF is requried so we can access the NSPanel PSRAM
     # which is on non-standard pins. ESP-IDF also uses less flash than Arduino!
+    # note: Arduino support is deprecated and will be dropped in the future
     type: esp-idf
 
 external_components:
@@ -37,12 +38,15 @@ nspanel_lovelace:
     ##   - German/Deutsch: de.json
     ##   - Greek/Νέα Ελληνικά: el.json
     ##   - Spanish/Español: es.json
+    ##   - Polish/Polski: pl.json
     ## NOTE: This feature is in beta so the translation keys and values could change at any time!
     ##       Any custom translation files you create will need to be kept in sync with the the files on the repo
     ##       https://github.com/olicooper/esphome-nspanel-lovelace-native/tree/dev/components/nspanel_lovelace/translations
     # language: en
     # temperature_unit: celcius
   screensaver:
+    # Use this to enable double tapping to exit the screensaver
+    # double_tap_to_unlock: false
     time_id: homeassistant_time
     ## For formatting options see: https://cplusplus.com/reference/ctime/strftime/
     # time_format: '%H:%M'

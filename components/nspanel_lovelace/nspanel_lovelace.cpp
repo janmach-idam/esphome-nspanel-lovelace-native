@@ -16,6 +16,7 @@
 #include "esphome/core/application.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/util.h"
+#include "esphome/core/version.h"
 #include "esphome/components/json/json_util.h"
 
 #include "cards.h"
@@ -29,30 +30,44 @@ namespace esphome {
 namespace nspanel_lovelace {
 
 // Use PSRAM for ArduinoJson (if available, otherwise use normal malloc)
-// see: https://arduinojson.org/v6/how-to/use-external-ram-on-esp32/#how-to-use-the-psram-with-arduinojson
-struct SpiRamAllocator {
-  void* allocate(size_t size) {
+struct SpiRamAllocator
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2025,7,0)
+ : ArduinoJson::Allocator
+#endif
+{
+  void* allocate(size_t size)
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2025,7,0)
+  override
+#endif
+  {
    if (psram_available())
      return heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
    else
      return malloc(size);
   }
 
-  void deallocate(void* pointer) {
+  void deallocate(void* pointer)
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2025,7,0)
+  override
+#endif
+  {
     if (psram_available())
       heap_caps_free(pointer);
     else
       return free(pointer);
   }
 
-  void* reallocate(void* ptr, size_t new_size) {
+  void* reallocate(void* ptr, size_t new_size)
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2025,7,0) 
+  override
+#endif
+  {
     if (psram_available())
       return heap_caps_realloc(ptr, new_size, MALLOC_CAP_SPIRAM);
     else
       return realloc(ptr, new_size);
   }
 };
-using SpiRamJsonDocument = BasicJsonDocument<SpiRamAllocator>;
 
 static const char *const TAG = "nspanel_lovelace";
 
@@ -81,6 +96,17 @@ void NSPanelLovelace::setup() {
   this->default_baud_rate_ = this->parent_->get_baud_rate();
 
   this->restore_state_();
+
+  // Create default and screensaver bookmarks if they doesn't exist.
+  // This won't overwrite any custom set values if set.
+  uint8_t bm_set_def = this->page_mgr_.bookmark_page((uint8_t)render_page_option::default_page, this->screensaver_ ? 1 : 0);
+  // Note: There will always need to be a screensaver page so use the first page regardless.
+  uint8_t bm_set_scr = this->page_mgr_.bookmark_page((uint8_t)render_page_option::screensaver_page, 0);
+  #if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG
+    if (!bm_set_def) bm_set_def = 2 + this->page_mgr_.has_bookmark((uint8_t)render_page_option::default_page);
+    if (!bm_set_scr) bm_set_scr = 2 + this->page_mgr_.has_bookmark((uint8_t)render_page_option::screensaver_page);
+    ESP_LOGD(TAG, "Bookmarks configured def:%u,scr:%u", bm_set_def, bm_set_scr);
+  #endif
 
 #ifdef USE_TIME
   this->setup_time_();
@@ -344,7 +370,7 @@ void NSPanelLovelace::loop() {
     this->force_current_page_update_ = false;
     ESP_LOGD(TAG, "Render HA update");
     if (this->popup_page_current_uuid_.empty()) {
-      this->render_item_update_(this->current_page_);
+      this->render_item_update_();
     } else {
       this->render_popup_page_update_(this->cached_page_item_);
     }
@@ -526,9 +552,7 @@ void NSPanelLovelace::process_command_(const std::string &message) {
     this->render_popup_page_(tokens.at(3));
   } else if (tokens.at(1) == action_type::sleepReached) {
     //std::string page = tokens.at(2);
-
-    // todo: temporary, render default page instead
-    this->render_page_(render_page_option::screensaver);
+    this->render_page_(render_page_option::screensaver_page);
   } else if (tokens.at(1) == action_type::startup) {
     if (tokens.size() == 4) {
       uint16_t ver = 0;
@@ -545,7 +569,8 @@ void NSPanelLovelace::process_command_(const std::string &message) {
     }
     // restore dimmode state
     this->set_display_dim();
-    this->render_page_(render_page_option::screensaver);
+    this->force_current_page_update_ = true;
+    this->render_page_(render_page_option::screensaver_page);
 #ifdef USE_TIME
     // If the TFT is reset then the time needs reconfiguring
     if (this->time_configured_) {
@@ -557,57 +582,115 @@ void NSPanelLovelace::process_command_(const std::string &message) {
   this->incoming_msg_callback_.call(message);
 }
 
-void NSPanelLovelace::render_page_(size_t index) {
-  if (index > this->pages_.size() - 1) return;
-  this->current_page_index_ = index;
-  this->current_page_ = this->pages_.at(index).get();
+void NSPanelLovelace::render_page_(const std::string &uuid) {
+  auto current_page = this->page_mgr_.current_page();
+  if (!current_page) {
+    ESP_LOGW(TAG, "Render page: no current page");
+    return;
+  }
+  auto page = this->page_mgr_.find_page(uuid, true);
+  if (!page) {
+    ESP_LOGW(TAG, "Render page: uuid not found %s", uuid.c_str());
+    return;
+  }
+  else if (current_page == page && !this->force_current_page_update_) return;
   this->force_current_page_update_ = false;
   this->render_current_page_();
 }
 
 void NSPanelLovelace::render_page_(render_page_option d) {
-  uint8_t start_page_index = 1;
-  if (d == render_page_option::default_page) {
-    // todo: fetch default page from config
-    this->current_page_index_ = start_page_index;
-  } if (d == render_page_option::screensaver) {
-    this->current_page_index_ = this->screensaver_ == nullptr ? start_page_index : 0;
-  } else if (d == render_page_option::next) {
-    if (this->current_page_index_ == this->pages_.size() - 1)
-      this->current_page_index_ = start_page_index;
-    else 
-      ++this->current_page_index_;
-  } else if (d == render_page_option::prev) {
-    if (this->current_page_index_ <= start_page_index)
-      this->current_page_index_ = this->pages_.size() - 1;
-    else
-      --this->current_page_index_;
+  if (this->page_mgr_.pages_empty()) {
+    ESP_LOGW(TAG, "Render page: no pages");
+    return;
   }
-  this->current_page_ = this->pages_.at(this->current_page_index_).get();
+
+  auto current_page = this->page_mgr_.current_page();
+  // if (!current_page && d != render_page_option::default_page) {
+  //   current_page = this->page_mgr_
+  //     .find_bookmarked_page((uint8_t)render_page_option::default_page, true);
+  // }
+  Page* page = nullptr;
+  switch (d)
+  {
+  case render_page_option::screensaver_page:
+    if (current_page && current_page->is_type(page_type::screensaver)) {
+      page = current_page;
+      break;
+    }
+    page = this->page_mgr_
+      .find_bookmarked_page((uint8_t)render_page_option::screensaver_page, true);
+    if (!page) break;
+    if (!this->screensaver_) this->screensaver_ = static_cast<Screensaver*>(page);
+    this->force_current_page_update_ = true;
+    break;
+  case render_page_option::default_page:
+    page = this->page_mgr_
+      .find_bookmarked_page((uint8_t)render_page_option::default_page, true);
+    if (!page) page = this->page_mgr_.get_page(0);
+    break;
+  case render_page_option::next:
+    page = this->page_mgr_.next_page();
+    break;
+  case render_page_option::prev:
+    page = this->page_mgr_.previous_page();
+    break;
+  default:
+    ESP_LOGW(TAG, "Render page: invalid render option");
+    return;
+  }
+  
+  if (!page || !current_page) {
+    ESP_LOGW(TAG, "Render page: no page found %u,%u", !!page, !!current_page);
+  }
+
+  ESP_LOGD(TAG, "Render page: UUID curr='%s',new='%s' force=%u",
+    current_page ? current_page->get_uuid().c_str() : "null",
+    page ? page->get_uuid().c_str() : "null",
+    this->force_current_page_update_);
+
+  if (!current_page || !page) return;
+  if (current_page == page && !this->force_current_page_update_) {
+    return;
+  }
   this->force_current_page_update_ = false;
   this->render_current_page_();
 }
 
 void NSPanelLovelace::render_current_page_() {
-  if (this->current_page_ == nullptr)
-    this->render_page_(render_page_option::default_page);
+  if (this->page_mgr_.pages_empty()) {
+    ESP_LOGW(TAG, "Render current page: no pages");
+    return;
+  }
+  auto page = this->page_mgr_.current_page();
+  if (!page) {
+    // this->render_page_(render_page_option::screensaver_page);
+    return;
+  }
 
   this->command_buffer_.assign("pageType")
       .append(1, SEPARATOR)
-      .append(this->current_page_->get_render_type_str());
+      .append(page->get_render_type_str());
   this->send_buffered_command_();
   this->popup_page_current_uuid_.clear();
 
-  this->set_display_timeout(this->current_page_->get_sleep_timeout());
+  this->set_display_timeout(page->get_sleep_timeout());
   
-  this->render_item_update_(this->current_page_);
+  this->render_item_update_(page);
+}
+
+void NSPanelLovelace::render_item_update_() {
+  render_item_update_(this->page_mgr_.current_page());
 }
 
 void NSPanelLovelace::render_item_update_(Page *page) {
+  if (!page) {
+    ESP_LOGW(TAG, "Render item update: page null");
+    return;
+  }
   page->render(this->command_buffer_);
   this->send_buffered_command_();
 
-  if (page->is_type(page_type::screensaver) && this->screensaver_ != nullptr) {
+  if (this->screensaver_ != nullptr && page->is_type(page_type::screensaver)) {
     if (this->screensaver_->should_render_status_update()) {
       this->screensaver_->render_status_update(this->command_buffer_);
       this->send_buffered_command_();
@@ -654,13 +737,16 @@ void NSPanelLovelace::render_popup_notify_page_(const std::string &internal_id,
 }
 
 void NSPanelLovelace::render_popup_page_(const std::string &internal_id) {
-  if (this->current_page_ == nullptr) return;
   if (!this->render_popup_page_update_(internal_id)) return;
   this->set_display_timeout(10);
 }
 
 bool NSPanelLovelace::render_popup_page_update_(const std::string &internal_id) {
-  if (this->current_page_ == nullptr) return false;
+  auto page = this->page_mgr_.current_page();
+  if (!page) {
+    ESP_LOGW(TAG, "Render popup page: page null");
+    return false;
+  }
 
   // Sometimes a StatefulPageItem does not exist for an entity,
   // handle this edge case. Only certain cards support this.
@@ -671,7 +757,7 @@ bool NSPanelLovelace::render_popup_page_update_(const std::string &internal_id) 
       return false;
     }
     bool rendered = false;
-    if (this->current_page_->is_type(page_type::cardThermo)) {
+    if (page->is_type(page_type::cardThermo)) {
       if (entity->is_type(entity_type::climate)) {
         this->render_climate_detail_update_(entity);
         rendered = true;
@@ -684,9 +770,9 @@ bool NSPanelLovelace::render_popup_page_update_(const std::string &internal_id) 
   auto uuid = internal_id.substr(5);
 
   if (this->cached_page_item_ == nullptr || this->cached_page_item_->get_uuid() != uuid) {
-    if (this->current_page_->get_items().size() == 0) return false;
+    if (page->get_items().size() == 0) return false;
     // Only search for items in the current page to reduce processing time
-    for (auto &item : this->current_page_->get_items()) {
+    for (auto &item : page->get_items()) {
       if (item->get_uuid() != uuid) continue;
       if (auto page_item = page_item_cast<StatefulPageItem>(item.get())) {
         this->cached_page_item_ = page_item;
@@ -1222,14 +1308,14 @@ void NSPanelLovelace::render_fan_detail_update_(StatefulPageItem *item) {
 void NSPanelLovelace::dump_config() {
   ESP_LOGCONFIG(TAG, "NSPanelLovelace:");
   ESP_LOGCONFIG(TAG, "\tVersion: %s", NSPANEL_LOVELACE_BUILD_VERSION);
-  ESP_LOGCONFIG(TAG, "\tRAM: min_heap:%u psram_used:%zu int_min_free:%zu int_free:%zu int_max_free_blk:%zu",
+  ESP_LOGCONFIG(TAG, "\tRAM: min_heap:%lu psram_used:%zu int_min_free:%zu int_free:%zu int_max_free_blk:%zu",
     esp_get_minimum_free_heap_size(),
     psram_used(),
     heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
     heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
     heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
   ESP_LOGCONFIG(TAG, "\tState: pages:%zu,stateful_items:%zu,entities:%zu",
-      this->pages_.size(),
+      this->page_mgr_.page_count(),
       this->stateful_page_items_.size(),
       this->entities_.size());
 }
@@ -1295,7 +1381,8 @@ void NSPanelLovelace::notify_on_screensaver(
   // notification will not show up if we are not on the screensaver
   // todo: could force a switch to screensaver or show the notification if
   //       the user navigates back to screensaver within the timeout period
-  if (!this->current_page_->is_type(page_type::screensaver)) return;
+  auto page = this->page_mgr_.current_page();
+  if (!page || !page->is_type(page_type::screensaver)) return;
   
   this->send_display_command(
     std::string("notify").append(1,SEPARATOR)
@@ -1305,8 +1392,10 @@ void NSPanelLovelace::notify_on_screensaver(
   if (timeout_ms > 0) {
     // hide the notification after a period of time
     this->set_timeout(timeout_ms, [this]() {
-      if (!this->current_page_->is_type(page_type::screensaver)) return;
-      this->render_screensaver();
+      auto page = this->page_mgr_.current_page();
+      if (!page || !page->is_type(page_type::screensaver)) return;
+      force_current_page_update_ = true;
+      this->render_page_(render_page_option::screensaver_page);
     });
   }
 }
@@ -1610,16 +1699,6 @@ void NSPanelLovelace::check_time_() {
 
 #endif
 
-size_t NSPanelLovelace::find_page_index_by_uuid_(const std::string &uuid) const {
-  size_t index = 0;
-  for (auto &p : this->pages_) {
-    if (p->get_uuid() == uuid)
-      return index;
-    ++index;
-  }
-  return SIZE_MAX;
-}
-
 const std::string &NSPanelLovelace::try_replace_uuid_with_entity_id_(
     const std::string &uuid_or_entity_id) {
   // not a uuid if it does not begin with the uuid prefix
@@ -1640,6 +1719,44 @@ void NSPanelLovelace::process_button_press_(
     const std::string &value,
     bool called_from_timeout) {
   if (button_type.empty()) return;
+
+  // Screen tapped when on the screensaver, show the default card or use the first card in the config.
+  if (internal_id == to_string(page_type::screensaver) && button_type == button_type::bExit) {
+    // todo: make a note of last used card
+    //
+    // config.get("screensaver.defaultCard")
+    // use defaultCard if defaultCard not null
+
+    // _previous_card.clear();
+    // _current_card = action_type::screensaver;
+    // render_card(_current_card);
+
+    // exit screensaver when screen tapped once or twice when double tap is enabled
+    if ((!this->double_tap_to_unlock_ && value == "1") || value >= "2") {
+      this->render_page_(render_page_option::default_page);
+    }
+    // screen tapped multiple times
+    else {
+      // todo
+      // int tap_count = std::to_integer(value);
+    }
+    return;
+  }
+
+  if (button_type == button_type::sleepReached) {
+    // todo
+    // make a note of last used card then render screensaver
+    // _previous_card = _current_card;
+    // _current_card = action_type::screensaver;
+    // render_page_(_current_card);
+    this->render_page_(render_page_option::screensaver_page);
+    return;
+  }
+
+  if (button_type == button_type::bExit) {
+    this->render_current_page_();
+    return;
+  }
   
   // Throttle and filter processing of spammy actions to avoid command flooding
   if (!called_from_timeout) {
@@ -1674,37 +1791,6 @@ void NSPanelLovelace::process_button_press_(
     ESP_LOGV(TAG, "Lookup %s -> %s", internal_id.c_str(), entity_id.c_str());
     entity_type = get_entity_type(entity_id);
     if (entity_type == nullptr) return;
-  }
-
-  // Screen tapped when on the screensaver, show the default card or use the first card in the config.
-  if (internal_id == to_string(page_type::screensaver) && button_type == button_type::bExit) {
-    // todo: make a note of last used card
-    //
-    // config.get("screensaver.defaultCard")
-    // use defaultCard if defaultCard not null
-
-    // _previous_card.clear();
-    // _current_card = action_type::screensaver;
-    // render_card(_current_card);
-
-    // todo: temporary for testing
-    this->render_page_(render_page_option::default_page);
-    return;
-  }
-
-  if (button_type == button_type::sleepReached) {
-    // todo
-    // make a note of last used card then render screensaver
-    // _previous_card = _current_card;
-    // _current_card = action_type::screensaver;
-    // render_page_(_current_card);
-    this->render_page_(render_page_option::screensaver);
-    return;
-  }
-
-  if (button_type == button_type::bExit) {
-    this->render_current_page_();
-    return;
   }
 
   if (button_type == button_type::onOff) {
@@ -1780,10 +1866,17 @@ void NSPanelLovelace::process_button_press_(
         {to_string(ha_attr_type::tilt_position), value}
       }});
   } else if (button_type == button_type::button) {
+    if (!entity_type) return;
     if (entity_type == entity_type::navigate ||
         entity_type == entity_type::navigate_uuid) {
       auto uuid = internal_id.substr(strlen(entity_type) + 1);
-      this->render_page_(this->find_page_index_by_uuid_(uuid));
+      this->render_page_(uuid);
+    } else if (entity_type == entity_type::nav_prev) {
+      this->render_page_(render_page_option::prev);
+    } else if (entity_type == entity_type::nav_next) {
+      this->render_page_(render_page_option::next);
+    } else if (entity_type == entity_type::nav_up) {
+      this->render_current_page_();
     } else if (
         entity_type == entity_type::scene ||
         entity_type == entity_type::script) {
@@ -2068,7 +2161,8 @@ void NSPanelLovelace::process_button_press_(
   }
   // unlock card
   else if (button_type == button_type::cardUnlockUnlock) {
-    if (!this->current_page_->is_type(page_type::cardUnlock)) return;
+    auto page = this->page_mgr_.current_page();
+    if (!page || !page->is_type(page_type::cardUnlock)) return;
     // todo
   }
   // select & input_select
@@ -2122,6 +2216,9 @@ void NSPanelLovelace::process_button_press_(
           {to_string(ha_attr_type::duration), value}
         }});
     }
+  } else {
+    ESP_LOGW(TAG, "Unknown button press: id:%s btn:%s val:%s type:%u",
+      internal_id.c_str(), button_type.c_str(), value.c_str(), called_from_timeout);
   }
 }
 
@@ -2165,6 +2262,7 @@ void NSPanelLovelace::call_ha_service_(
     const char *entity_type, const std::string &action,
     const std::map<std::string, std::string> &data,
     const std::map<std::string, std::string> &data_template) {
+  if (!entity_type) return;
   this->call_ha_service_(
     std::string(entity_type).append(1, '.').append(action),
     data, data_template);
@@ -2175,23 +2273,37 @@ void NSPanelLovelace::call_ha_service_(
     const std::map<std::string, std::string> &data,
     const std::map<std::string, std::string> &data_template) {
   api::HomeassistantServiceResponse resp;
-  resp.service = service;
+  #if ESPHOME_VERSION_CODE >= VERSION_CODE(2025,8,0)
+    resp.set_service(esphome::StringRef(service));
+  #else
+    resp.service = service;
+  #endif
 
-  auto it = data.find(to_string(ha_attr_type::entity_id));
-  if (it == data.end())
-    ESP_LOGD(TAG, "Call HA: %s -> %s", resp.service.c_str(), it->second.c_str());
-  else
-    ESP_LOGD(TAG, "Call HA: %s", resp.service.c_str());
+  #if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG
+    auto it = data.find(to_string(ha_attr_type::entity_id));
+    if (it == data.end())
+      ESP_LOGD(TAG, "Call HA: %s -> %s", service.c_str(), it->second.c_str());
+    else
+      ESP_LOGD(TAG, "Call HA: %s", service.c_str());
+  #endif
 
   for (auto &it : data) {
     api::HomeassistantServiceMap kv;
-    kv.key = it.first;
+    #if ESPHOME_VERSION_CODE >= VERSION_CODE(2025,8,0)
+      kv.set_key(esphome::StringRef(it.first));
+    #else
+      kv.key = it.first;
+    #endif
     kv.value = it.second;
     resp.data.push_back(kv);
   }
   for (auto &it : data_template) {
     api::HomeassistantServiceMap kv;
-    kv.key = it.first;
+    #if ESPHOME_VERSION_CODE >= VERSION_CODE(2025,8,0)
+      kv.set_key(esphome::StringRef(it.first));
+    #else
+      kv.key = it.first;
+    #endif
     kv.value = it.second;
     resp.data_template.push_back(kv);
   }
@@ -2227,10 +2339,11 @@ void NSPanelLovelace::on_entity_attribute_update_(std::string entity_id, std::st
   // This re-schedules updates every time one happens within a 200ms period.
   this->set_timeout(entity_id, 200, [this, entity_id] () {
     if (this->force_current_page_update_) return;
-    if (this->current_page_ == nullptr) return;
+    auto page = this->page_mgr_.current_page();
+    if (!page) return;
 
     if (this->screensaver_ != nullptr && 
-        this->current_page_->is_type(page_type::screensaver)) {
+        page->is_type(page_type::screensaver)) {
       force_current_page_update_ = 
         this->screensaver_->should_render_status_update(entity_id);
       return;
@@ -2238,7 +2351,7 @@ void NSPanelLovelace::on_entity_attribute_update_(std::string entity_id, std::st
 
     // re-render only if the entity is on the currently active card
     // todo: this doesnt account for popup pages
-    for (auto &item : this->current_page_->get_items()) {
+    for (auto &item : page->get_items()) {
       auto stateful_item = page_item_cast<StatefulPageItem>(item.get());
       if (stateful_item == nullptr) continue;
       
@@ -2252,17 +2365,17 @@ void NSPanelLovelace::on_entity_attribute_update_(std::string entity_id, std::st
     // Thermo cards don't have items to check, only a single thermo entity
     // render updates when climate entitites are updated
     if (entity_type == entity_type::climate &&
-        this->current_page_->is_type(page_type::cardThermo)) {
+        page->is_type(page_type::cardThermo)) {
       force_current_page_update_ = true;
       return;
     }
     else if (entity_type == entity_type::media_player &&
-        this->current_page_->is_type(page_type::cardMedia)) {
+        page->is_type(page_type::cardMedia)) {
       force_current_page_update_ = true;
       return;
     }
     else if (entity_type == entity_type::alarm_control_panel &&
-        this->current_page_->is_type(page_type::cardAlarm)) {
+        page->is_type(page_type::cardAlarm)) {
       force_current_page_update_ = true;
       return;
     }
@@ -2271,13 +2384,14 @@ void NSPanelLovelace::on_entity_attribute_update_(std::string entity_id, std::st
     // if (this->popup_page_current_uuid_ == item->get_uuid()) {
     //   this->render_popup_page_update_(item);
     // } else if (this->popup_page_current_uuid_.empty()) {
-    //   this->render_item_update_(this->current_page_);
+    //   this->render_item_update_(page);
     // }
   });
 }
 
 void NSPanelLovelace::send_weather_update_command_() {
-  if (this->current_page_ != this->screensaver_)
+  if (!this->screensaver_ ||
+      this->page_mgr_.current_page() != this->screensaver_)
     return;
   this->screensaver_->render(this->command_buffer_);
   this->send_buffered_command_();
@@ -2307,11 +2421,16 @@ void NSPanelLovelace::on_weather_temperature_unit_update_(std::string entity_id,
 }
 
 void NSPanelLovelace::on_weather_forecast_update_(std::string entity_id, std::string forecast_json) {
+  ESP_LOGV(TAG, "Weather forecast update (%u): %zu %s",
+    this->screensaver_ == nullptr, forecast_json.length(), forecast_json.c_str());
   if (this->screensaver_ == nullptr) return;
   // todo: check if we are on the screensaver otherwise don't update
   // todo: implement color updates: "color~background~tTime~timeAMPM~tDate~tMainText~tForecast1~tForecast2~tForecast3~tForecast4~tForecast1Val~tForecast2Val~tForecast3Val~tForecast4Val~bar~tMainTextAlt2~tTimeAdd"
-
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2025,7,0)
+  ArduinoJson::JsonDocument filter;
+#else
   ArduinoJson::StaticJsonDocument<200> filter;
+#endif
   filter[0]["datetime"] = true;
   filter[0]["condition"] = true;
   filter[0]["temperature"] = true;
@@ -2324,23 +2443,31 @@ void NSPanelLovelace::on_weather_forecast_update_(std::string entity_id, std::st
   // Note: Unfortunately the json received is nearly 6KB!
   //       We filter the variables to consume less but it is still a lot,
   //       so we need to allocate an appropriate amount of memory to read it.
-  SpiRamJsonDocument doc(psram_available() ? 7680 : 6144);
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2025,7,0)
+  static SpiRamAllocator allocator;
+  JsonDocument doc(&allocator);
+#else
+  BasicJsonDocument<SpiRamAllocator> doc(psram_available() ? 7680 : 6144);
+#endif
   ArduinoJson::DeserializationError error = ArduinoJson::deserializeJson(
-    doc, (char *)forecast_json.data(), DeserializationOption::Filter(filter));
+    doc, forecast_json, DeserializationOption::Filter(filter));
   App.feed_wdt();
 
   if (error || doc.overflowed()) {
-    ESP_LOGW(TAG, "Weather unparsable: %s", error ? error.c_str() : "doc overflow");
+    ESP_LOGW(TAG, "Weather unparsable: %s %zu '%s'", error ? error.c_str() : "doc overflow",
+      forecast_json.length(), forecast_json.c_str());
     return;
   }
 
   this->command_buffer_.clear();
+  ArduinoJson::JsonArray docArr = doc.as<ArduinoJson::JsonArray>();
+  ESP_LOGV(TAG, "Weather forecast update s=%u", docArr.size());
 
   // check if forecast is hourly or daily
   auto weather_entity_is_hourly = false;
-  if (doc.size() > 1) {
-    auto date1 = doc[0]["datetime"].as<const char *>();
-    auto date2 = doc[1]["datetime"].as<const char *>();
+  if (docArr.size() > 1) {
+    const char * date1 = docArr[0]["datetime"];
+    const char * date2 = docArr[1]["datetime"];
     tm t{};
     if (iso8601_to_tm(date1, t)) {
       uint8_t hr = t.tm_hour;
@@ -2353,12 +2480,14 @@ void NSPanelLovelace::on_weather_forecast_update_(std::string entity_id, std::st
   char buff[16] = {};
   uint8_t index = 1, item_count = this->screensaver_->get_items().size();
 
-  for (const ArduinoJson::JsonObject &item : doc.as<ArduinoJson::JsonArray>()) {
+  for (const ArduinoJson::JsonObject &item : docArr) {
     // can only display the first 4 items (minus 1 for the current weather)
-    if (index == item_count)
+    if (index >= item_count)
       break;
 
     auto weatherItem = this->screensaver_->get_item<WeatherItem>(index);
+    ++index;
+
     if (weatherItem == nullptr)
       continue;
 
@@ -2369,7 +2498,7 @@ void NSPanelLovelace::on_weather_forecast_update_(std::string entity_id, std::st
     // todo: import temperature symbol from config
     tm t{};
     // Parse date e.g. 2023-08-22T21:00:00+00:00
-    if (!iso8601_to_tm(item["datetime"], t)) {
+    if (!iso8601_to_tm(item["datetime"].as<const char *>(), t)) {
       ESP_LOGW(TAG, "Weather 'datetime' unparsable: %s", item["datetime"].as<const char *>());
       // return;
       t = { 
@@ -2424,8 +2553,6 @@ void NSPanelLovelace::on_weather_forecast_update_(std::string entity_id, std::st
     
     snprintf(buff, sizeof(buff), "%.1f", item["temperature"].as<float>());
     weatherItem->set_value(buff);
-
-    ++index;
   }
   this->send_weather_update_command_();
 }

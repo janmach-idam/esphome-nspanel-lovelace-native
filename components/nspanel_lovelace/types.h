@@ -12,7 +12,13 @@
 namespace esphome {
 namespace nspanel_lovelace {
 
-enum class render_page_option : uint8_t { prev, next, screensaver, default_page };
+enum class render_page_option : uint8_t {
+  prev, next,
+  // The page that is used when the screen is inactive/sleeping
+  screensaver_page,
+  // The page that is used when the screen goes from 'inactive' to 'active' (exiting sleep)
+  default_page
+};
 
 enum class alarm_arm_action : uint8_t { arm_home, arm_away, arm_night, arm_vacation, arm_custom_bypass };
 
@@ -182,6 +188,7 @@ struct entity_state {
   // alarm_control_panel
   static constexpr const char* disarmed = "disarmed";
   static constexpr const char* arming = "arming";
+  static constexpr const char* disarming = "disarming";
   static constexpr const char* pending = "pending";
   static constexpr const char* triggered = "triggered";
   static constexpr const char* armed_home = "armed_home";
@@ -937,7 +944,7 @@ static constexpr FrozenCharMap<const icon_char_t *, 9> MEDIA_TYPE_ICON_MAP {{
   std::pair<const char*, const icon_char_t*>{ha_attr_media_content_type::url, icon_t::link_box_outline}, // newly added! (OR cast E117?)
 }};
 
-const FrozenCharMap<Icon, 10> ALARM_ICON_MAP {{
+const FrozenCharMap<Icon, 11> ALARM_ICON_MAP {{
   std::pair<const char*, Icon>{entity_state::unknown, Icon{icon_t::shield_off, 0x0CE6u}}, //green
   std::pair<const char*, Icon>{entity_state::disarmed, Icon{icon_t::shield_off, 0x0CE6u}}, //green
   std::pair<const char*, Icon>{entity_state::armed_home, Icon{icon_t::shield_home, 0xE243u}}, //red
@@ -946,6 +953,7 @@ const FrozenCharMap<Icon, 10> ALARM_ICON_MAP {{
   std::pair<const char*, Icon>{entity_state::armed_vacation, Icon{icon_t::shield_airplane, 0xE243u}}, //red
   std::pair<const char*, Icon>{entity_state::armed_custom_bypass, Icon{icon_t::shield, 0xE243u}}, //red
   std::pair<const char*, Icon>{entity_state::arming, Icon{icon_t::shield, 0xED80u}}, //orange
+  std::pair<const char*, Icon>{entity_state::disarming, Icon{icon_t::shield, 0xED80u}}, //orange
   std::pair<const char*, Icon>{entity_state::pending, Icon{icon_t::shield, 0xED80u}}, //orange
   std::pair<const char*, Icon>{entity_state::triggered, Icon{icon_t::bell_ring, 0xE243u}}, //red
 }};
@@ -1007,9 +1015,11 @@ static constexpr FrozenCharMap<const char *, 29> ENTITY_RENDER_TYPE_MAP {{
 inline const char *get_entity_type(const std::string &entity_id) {
   auto pos = entity_id.find('.');
   if (pos == std::string::npos) {
-    if (entity_id == entity_type::delete_)
-      return entity_type::delete_;
-    return nullptr;
+    if (entity_id == entity_type::delete_) return entity_type::delete_;
+    else if (entity_id == entity_type::nav_up) return entity_type::nav_up;
+    else if (entity_id == entity_type::nav_prev) return entity_type::nav_prev;
+    else if (entity_id == entity_type::nav_next) return entity_type::nav_next;
+    else return nullptr;
   }
   
 	auto type = entity_id.substr(0, pos);
@@ -1045,9 +1055,6 @@ inline const char *get_entity_type(const std::string &entity_id) {
   else if (type == entity_type::weather) return entity_type::weather;
 
   // internal (non HA) types
-  else if (type == entity_type::nav_up) return entity_type::nav_up;
-  else if (type == entity_type::nav_prev) return entity_type::nav_prev;
-  else if (type == entity_type::nav_next) return entity_type::nav_next;
   else if (type == entity_type::uuid) return entity_type::uuid;
   else if (type == entity_type::navigate) {
     if (entity_id.length() > (pos + 5) &&
